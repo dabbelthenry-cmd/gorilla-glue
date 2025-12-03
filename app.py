@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import yfinance as yf
 from ML_engine import MLEngine
 from database import init_db, add_risk_score, get_risk_scores
+from fundamentals import FundamentalsService
+from news_service import NewsService
 
 # RAG Imports
 try:
@@ -521,6 +523,8 @@ else:
 # Save current score to database for persistent 6-month history
 add_risk_score(currency_pair, risk_score, action, position_type)
 
+
+
 # --- DISPLAY ANALYSIS ---
 st.markdown("---")
 st.markdown('<div class="analysis-container">', unsafe_allow_html=True)
@@ -736,3 +740,55 @@ if forecast_df is not None:
 
 else:
     st.warning("Not enough data to generate prediction.")
+
+# --- FUNDAMENTAL ANALYSIS & NEWS ---
+st.markdown("---")
+st.header("📊 Fundamental Analysis & Economic News")
+
+col_fund, col_news = st.columns([1, 1])
+
+with col_fund:
+    st.subheader("Economic Indicators")
+    st.caption(f"{currency_pair.split('/')[0]} vs {currency_pair.split('/')[1]}")
+    
+    base_ccy = currency_pair.split('/')[0]
+    quote_ccy = currency_pair.split('/')[1]
+    
+    fund_service = FundamentalsService()
+    fund_df = fund_service.get_comparison_df(base_ccy, quote_ccy)
+    
+    if fund_df is not None:
+        st.dataframe(
+            fund_df, 
+            use_container_width=True, 
+            hide_index=True,
+            column_config={
+                "Metric": st.column_config.TextColumn("Indicator", width="medium"),
+                base_ccy: st.column_config.TextColumn(f"{base_ccy}", width="small"),
+                quote_ccy: st.column_config.TextColumn(f"{quote_ccy}", width="small")
+            }
+        )
+    else:
+        st.warning("Fundamental data not available.")
+
+with col_news:
+    st.subheader("Major Economic News")
+    st.caption("Recent headlines affecting the selected currencies.")
+    
+    news_service = NewsService()
+    news_items = news_service.get_combined_news(base_ccy, quote_ccy)
+    
+    if news_items:
+        for item in news_items:
+            # Color code based on currency
+            badge_color = "#1f6feb" if item['currency'] == base_ccy else "#238636" # Blue for Base, Green for Quote
+            st.markdown(f"""
+            <div style="padding: 10px; border-radius: 5px; background-color: #161b22; border: 1px solid #30363d; margin-bottom: 10px;">
+                <span style="background-color: {badge_color}; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.7em; font-weight: bold;">{item['currency']}</span>
+                <span style="color: #8b949e; font-size: 0.8em; margin-left: 8px;">{item['time']}</span>
+                <div style="margin-top: 5px; font-weight: 500; font-size: 0.9em;">{item['title']}</div>
+                <div style="color: #8b949e; font-size: 0.75em; margin-top: 2px;">Source: {item['source']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+    else:
+        st.info("No recent major news found.")
