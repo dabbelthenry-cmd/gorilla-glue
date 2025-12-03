@@ -1,0 +1,14 @@
+streamlit
+yfinance
+pandas
+numpy
+scikit-learn
+ta
+matplotlib
+plotly
+langchain
+langchain-openai
+langchain-community
+chromadb
+openai
+tiktoken

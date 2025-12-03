@@ -1,0 +1,13 @@
+# Secrets
+**/secrets.toml
+*.toml
+.env
+
+# Database
+trades.db
+*.db
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store

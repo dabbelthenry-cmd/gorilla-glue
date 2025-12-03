@@ -1,0 +1,55 @@
+FX Hedging Strategy Knowledge Base
+
+1. Strategy Overview
+The FX Hedging Strategy is a confluence-based technical model designed to quantify the risk of a trend reversal against a user's current market position (Long or Short). It calculates a "Risk Score" from 0 to 100, where a higher score indicates a higher probability of reversal and thus a greater need to hedge.
+
+2. Scoring System (0-100)
+The total score is the sum of points from four key technical indicators. The score is normalized to 100 based on the active indicators.
+
+   - Trend (30 points): Uses Exponential Moving Average (EMA) and Simple Moving Average (SMA).
+   - Momentum (30 points): Uses Moving Average Convergence Divergence (MACD).
+   - Volatility (25 points): Uses Bollinger Bands (BB).
+   - RSI (15 points): Uses Relative Strength Index (RSI).
+
+3. Indicator Logic
+
+   A. Trend (Weight: 30)
+      - Bullish Signal: EMA is greater than SMA.
+      - Bearish Signal: EMA is less than or equal to SMA.
+      - Contribution: If the signal opposes your position (e.g., Bearish signal when you are Long), it adds 30 points to the Risk Score.
+
+   B. Momentum (Weight: 30)
+      - Bullish Signal: MACD line is greater than the Signal Line AND MACD is greater than 0.
+      - Bearish Signal: MACD line is less than Signal Line OR MACD is less than 0.
+      - Contribution: If the signal opposes your position, it adds 30 points to the Risk Score.
+
+   C. Volatility (Weight: 25)
+      - Bullish Signal: Price is greater than the Bollinger Band Upper Band OR the Middle Band is rising.
+      - Bearish Signal: Price is not above Upper Band AND Middle Band is not rising.
+      - Contribution: If the signal opposes your position, it adds 25 points to the Risk Score.
+
+   D. RSI (Weight: 15)
+      - Bullish Signal: RSI is greater than 50 AND RSI is rising AND RSI is less than 70 (not overbought).
+      - Bearish Signal: RSI conditions are not met.
+      - Contribution: If the signal opposes your position, it adds 15 points to the Risk Score.
+
+4. Risk Score Interpretation & Actions
+
+   - Score 80-100: Strong Hedge (75-100%)
+     - High risk of reversal.
+     - Action: Open a large hedging position (e.g., Sell EUR/USD if Long) to protect capital.
+
+   - Score 60-79: Moderate Hedge (50-75%)
+     - Significant risk present.
+     - Action: Open a moderate hedging position.
+
+   - Score 40-59: Partial Hedge (25-50%)
+     - Some risk factors are present.
+     - Action: Maintain a small protective hedge.
+
+   - Score 0-39: No Hedge / Unwind
+     - Low risk of reversal. Market is moving in your favor.
+     - Action: No hedge needed; allow the position to run.
+
+5. Dynamic Scoring
+The system is dynamic. If an indicator is not selected on the chart, it is removed from the calculation, and the total score is re-normalized to 100 based on the remaining active indicators.
