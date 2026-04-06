@@ -1,13 +1,11 @@
+import os
+from datetime import datetime, timedelta, time
+
+import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
-import sqlite3
-import os
 
-# Custom Modules
 from ML_engine import MLEngine
 from database import init_db, add_risk_score, get_risk_scores
 from fundamentals import FundamentalsService
@@ -21,29 +19,29 @@ try:
     from langchain_community.vectorstores import Chroma
     from langchain_openai import ChatOpenAI
     from langchain.chains import RetrievalQA
-    import openai
+    import openai  # noqa: F401
     RAG_AVAILABLE = True
 except ImportError:
     RAG_AVAILABLE = False
+
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
     page_title="Gorilla Glue | FX Hedging Dashboard",
     page_icon="🦍",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
+
 # --- CUSTOM CSS (Financial Terminal Look) ---
-st.markdown("""
+st.markdown(
+    """
 <style>
-    /* Global Theme */
     .stApp {
         background-color: #0d1117;
         color: #c9d1d9;
     }
-    
-    /* Metrics Cards */
     div[data-testid="stMetric"] {
         background-color: #161b22;
         border: 1px solid #30363d;
@@ -59,8 +57,6 @@ st.markdown("""
         color: #f0f6fc;
         font-weight: 600;
     }
-    
-    /* Risk Score Badges */
     .risk-badge-critical {
         background-color: #7f1d1d;
         color: #fecaca;
@@ -93,8 +89,6 @@ st.markdown("""
         font-weight: bold;
         border: 1px solid #4b5563;
     }
-    
-    /* Tabs */
     .stTabs [data-baseweb="tab-list"] {
         gap: 24px;
     }
@@ -111,58 +105,170 @@ st.markdown("""
         color: #58a6ff;
         border-bottom: 2px solid #58a6ff;
     }
-    
-    /* Headers */
     h1, h2, h3 {
         color: #f0f6fc;
         font-family: 'Segoe UI', sans-serif;
     }
-    
-    /* Sidebar */
     section[data-testid="stSidebar"] {
         background-color: #010409;
         border-right: 1px solid #30363d;
     }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
+
 
 # --- INITIALIZATION ---
 init_db()
+
+TICKER_MAP = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "USD/CHF": "CHF=X",
+    "AUD/USD": "AUDUSD=X",
+}
+INDICATOR_WEIGHTS = {
+    "Trend": 30,
+    "Momentum": 30,
+    "Volatility": 25,
+    "RSI": 15,
+}
+MIN_LOOKBACK_DAYS = 60
+WARMUP_DAYS = 90
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_market_data(ticker: str, start: str, end: str) -> pd.DataFrame:
+    df = yf.download(ticker, start=start, end=end, interval="1d", progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy()
+    data["SMA"] = data["Close"].rolling(window=20).mean()
+    data["EMA"] = data["Close"].ewm(span=20, adjust=False).mean()
+    data["BB_Middle"] = data["Close"].rolling(window=20).mean()
+    data["BB_Std"] = data["Close"].rolling(window=20).std()
+    data["BB_Upper"] = data["BB_Middle"] + (2 * data["BB_Std"])
+    data["BB_Lower"] = data["BB_Middle"] - (2 * data["BB_Std"])
+
+    delta = data["Close"].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    data["RSI"] = 100 - (100 / (1 + rs))
+
+    exp1 = data["Close"].ewm(span=12, adjust=False).mean()
+    exp2 = data["Close"].ewm(span=26, adjust=False).mean()
+    data["MACD"] = exp1 - exp2
+    data["Signal_Line"] = data["MACD"].ewm(span=9, adjust=False).mean()
+    return data
+
+
+def compute_signal_details(last_row: pd.Series, prev_row: pd.Series, selected_indicators: list[str]) -> dict:
+    trend_active = "SMA" in selected_indicators and "EMA" in selected_indicators
+    trend_bullish = bool(last_row["EMA"] > last_row["SMA"])
+
+    momentum_active = "MACD" in selected_indicators
+    momentum_bullish = bool((last_row["MACD"] > last_row["Signal_Line"]) and (last_row["MACD"] > 0))
+
+    volatility_active = "Bollinger Bands" in selected_indicators
+    bb_middle_rising = bool(last_row["BB_Middle"] > prev_row["BB_Middle"])
+    volatility_bullish = bool((last_row["Close"] > last_row["BB_Upper"]) or bb_middle_rising)
+
+    rsi_active = "RSI" in selected_indicators
+    rsi_rising = bool(last_row["RSI"] > prev_row["RSI"])
+    rsi_bullish = bool((last_row["RSI"] > 50) and rsi_rising and (last_row["RSI"] < 70))
+
+    return {
+        "Trend": {"active": trend_active, "bullish": trend_bullish, "points": INDICATOR_WEIGHTS["Trend"]},
+        "Momentum": {"active": momentum_active, "bullish": momentum_bullish, "points": INDICATOR_WEIGHTS["Momentum"]},
+        "Volatility": {"active": volatility_active, "bullish": volatility_bullish, "points": INDICATOR_WEIGHTS["Volatility"]},
+        "RSI": {"active": rsi_active, "bullish": rsi_bullish, "points": INDICATOR_WEIGHTS["RSI"]},
+    }
+
+
+def compute_risk_score(signal_details: dict, position_type: str) -> dict:
+    bullish_points = sum(item["points"] for item in signal_details.values() if item["active"] and item["bullish"])
+    max_points = sum(item["points"] for item in signal_details.values() if item["active"])
+
+    bullish_score = int((bullish_points / max_points) * 100) if max_points > 0 else 0
+    bearish_score = 100 - bullish_score
+
+    if position_type == "Long":
+        risk_score = bearish_score
+        risk_label = "Bearish Reversal Risk"
+    else:
+        risk_score = bullish_score
+        risk_label = "Bullish Reversal Risk"
+
+    if max_points == 0:
+        action = "N/A"
+        badge_class = "risk-badge-low"
+    elif risk_score >= 80:
+        action = "Strong Hedge (75-100%)"
+        badge_class = "risk-badge-critical"
+    elif risk_score >= 60:
+        action = "Moderate Hedge (50-75%)"
+        badge_class = "risk-badge-high"
+    elif risk_score >= 40:
+        action = "Partial Hedge (25-50%)"
+        badge_class = "risk-badge-med"
+    else:
+        action = "No Hedge / Unwind"
+        badge_class = "risk-badge-low"
+
+    return {
+        "bullish_points": bullish_points,
+        "max_points": max_points,
+        "bullish_score": bullish_score,
+        "bearish_score": bearish_score,
+        "risk_score": risk_score,
+        "risk_label": risk_label,
+        "action": action,
+        "badge_class": badge_class,
+    }
+
 
 # --- SIDEBAR CONTROLS ---
 with st.sidebar:
     st.title("🦍 Gorilla Glue")
     st.caption("FX Hedging Intelligence")
     st.markdown("---")
-    
-    # 1. Configuration
+
     st.subheader("⚙️ Configuration")
-    currency_pair = st.selectbox("Currency Pair", ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD"])
-    position_type = st.radio("Position Type", ["Long", "Short"], horizontal=True, help="Long: You own the currency. Short: You owe the currency.")
-    
-    # 2. Indicators
+    currency_pair = st.selectbox("Currency Pair", list(TICKER_MAP.keys()))
+    position_type = st.radio(
+        "Position Type",
+        ["Long", "Short"],
+        horizontal=True,
+        help="Long: You own the currency. Short: You owe the currency.",
+    )
+
     st.subheader("📈 Indicators")
     selected_indicators = st.multiselect(
         "Active Signals",
         ["SMA", "EMA", "Bollinger Bands", "RSI", "MACD"],
-        default=["SMA", "EMA", "Bollinger Bands", "RSI", "MACD"]
+        default=["SMA", "EMA", "Bollinger Bands", "RSI", "MACD"],
     )
-    
-    # 3. Date Range (for History)
-    st.subheader("📅 History Range")
-    default_start = datetime.now() - timedelta(days=365)
+
+    st.subheader("📅 Analysis Date Range")
+    default_start = datetime.now().date() - timedelta(days=365)
     start_date = st.date_input("Start Date", value=default_start)
-    end_date = st.date_input("End Date", value=datetime.now())
-    
+    end_date = st.date_input("End Date", value=datetime.now().date())
+    st.caption("The score, charts, and forecast now use this selected range.")
+
     st.markdown("---")
-    
-    # 4. AI Assistant
     st.subheader("🤖 AI Assistant")
     api_key = st.text_input("OpenAI API Key", type="password", help="Required for RAG Chatbot")
-    
+
     if api_key:
         os.environ["OPENAI_API_KEY"] = api_key
-        
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
@@ -174,7 +280,7 @@ with st.sidebar:
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
-            
+
         with st.chat_message("assistant"):
             if not api_key:
                 st.error("Please enter an OpenAI API Key.")
@@ -182,27 +288,29 @@ with st.sidebar:
                 st.error("RAG dependencies not installed.")
             else:
                 try:
-                    # Initialize RAG (Simplified for demo)
                     embeddings = OpenAIEmbeddings()
                     if not os.path.exists("knowledge_base.txt"):
                         with open("knowledge_base.txt", "w") as f:
                             f.write("Gorilla Glue is an FX hedging tool using technical analysis and ML.")
-                    
+
                     loader = TextLoader("knowledge_base.txt")
                     documents = loader.load()
                     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
                     texts = text_splitter.split_documents(documents)
-                    
-                    # Use a persistent directory for Chroma to avoid re-indexing
+
                     persist_directory = "./chroma_db"
-                    vectordb = Chroma.from_documents(documents=texts, embedding=embeddings, persist_directory=persist_directory)
-                    
+                    vectordb = Chroma.from_documents(
+                        documents=texts,
+                        embedding=embeddings,
+                        persist_directory=persist_directory,
+                    )
+
                     qa_chain = RetrievalQA.from_chain_type(
                         llm=ChatOpenAI(model_name="gpt-3.5-turbo"),
                         chain_type="stuff",
-                        retriever=vectordb.as_retriever()
+                        retriever=vectordb.as_retriever(),
                     )
-                    
+
                     response = qa_chain.run(prompt)
                     st.markdown(response)
                     st.session_state.messages.append({"role": "assistant", "content": response})
@@ -211,396 +319,341 @@ with st.sidebar:
 
 
 # --- DATA FETCHING & LOGIC ---
-
-# 1. Fetch Data
-ticker_map = {
-    "EUR/USD": "EURUSD=X", "GBP/USD": "GBPUSD=X", "USD/JPY": "JPY=X",
-    "USD/CHF": "CHF=X", "AUD/USD": "AUDUSD=X"
-}
-ticker = ticker_map.get(currency_pair)
-
-# Fetch 2 years of data for robust calculation
-df = yf.download(ticker, period="2y", interval="1d", progress=False)
-
-# Flatten MultiIndex if present
-if isinstance(df.columns, pd.MultiIndex):
-    df.columns = df.columns.get_level_values(0)
-
-if df.empty:
-    st.error("Failed to fetch data. Please check your connection.")
+if start_date >= end_date:
+    st.error("Start date must be before end date.")
     st.stop()
 
-# 2. Calculate Indicators
-# SMA
-df['SMA'] = df['Close'].rolling(window=20).mean()
-# EMA
-df['EMA'] = df['Close'].ewm(span=20, adjust=False).mean()
-# Bollinger Bands
-df['BB_Middle'] = df['Close'].rolling(window=20).mean()
-df['BB_Std'] = df['Close'].rolling(window=20).std()
-df['BB_Upper'] = df['BB_Middle'] + (2 * df['BB_Std'])
-df['BB_Lower'] = df['BB_Middle'] - (2 * df['BB_Std'])
-# RSI
-delta = df['Close'].diff()
-gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-rs = gain / loss
-df['RSI'] = 100 - (100 / (1 + rs))
-# MACD
-exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-df['MACD'] = exp1 - exp2
-df['Signal_Line'] = df['MACD'].ewm(span=9, adjust=False).mean()
+selected_start_dt = pd.Timestamp(start_date)
+selected_end_dt = pd.Timestamp(end_date)
+fetch_start_dt = selected_start_dt - timedelta(days=WARMUP_DAYS)
+fetch_end_dt = selected_end_dt + timedelta(days=1)
 
-# 3. Calculate Risk Score (Logic moved to top)
-last_row = df.iloc[-1]
-prev_row = df.iloc[-2]
+ticker = TICKER_MAP[currency_pair]
+raw_df = fetch_market_data(
+    ticker,
+    fetch_start_dt.strftime("%Y-%m-%d"),
+    fetch_end_dt.strftime("%Y-%m-%d"),
+)
 
-bullish_points = 0
-max_points = 0
+if raw_df.empty:
+    st.error("Failed to fetch data. Please check your connection or date range.")
+    st.stop()
 
-# Trend (30 pts)
-if "SMA" in selected_indicators and "EMA" in selected_indicators:
-    max_points += 30
-    if last_row['EMA'] > last_row['SMA']:
-        bullish_points += 30
+analysis_df = calculate_indicators(raw_df)
+display_df = analysis_df[(analysis_df.index >= selected_start_dt) & (analysis_df.index < fetch_end_dt)].copy()
 
-# Momentum (30 pts)
-if "MACD" in selected_indicators:
-    max_points += 30
-    if (last_row['MACD'] > last_row['Signal_Line']) and (last_row['MACD'] > 0):
-        bullish_points += 30
+if display_df.empty:
+    st.error("No market data was returned for the selected date range.")
+    st.stop()
 
-# Volatility (25 pts)
-if "Bollinger Bands" in selected_indicators:
-    max_points += 25
-    bb_middle_rising = last_row['BB_Middle'] > prev_row['BB_Middle']
-    if (last_row['Close'] > last_row['BB_Upper']) or bb_middle_rising:
-        bullish_points += 25
+valid_score_df = display_df.dropna(subset=["SMA", "EMA", "BB_Middle", "BB_Upper", "RSI", "MACD", "Signal_Line"]).copy()
+if len(valid_score_df) < 2:
+    st.error(
+        "Not enough usable data in the selected range to calculate the indicators and risk score. "
+        "Choose a wider range."
+    )
+    st.stop()
 
-# RSI (15 pts)
-if "RSI" in selected_indicators:
-    max_points += 15
-    rsi_rising = last_row['RSI'] > prev_row['RSI']
-    if (last_row['RSI'] > 50) and rsi_rising and (last_row['RSI'] < 70):
-        bullish_points += 15
+if len(display_df) < MIN_LOOKBACK_DAYS:
+    st.warning(
+        f"Selected range is short ({len(display_df)} rows). The dashboard will still run, "
+        f"but {MIN_LOOKBACK_DAYS}+ rows is recommended for more stable signals and forecasting."
+    )
 
-# Normalize Score
-if max_points > 0:
-    bullish_score = int((bullish_points / max_points) * 100)
-else:
-    bullish_score = 0
+last_row = valid_score_df.iloc[-1]
+prev_row = valid_score_df.iloc[-2]
+current_price = last_row["Close"]
+price_change = last_row["Close"] - prev_row["Close"]
+price_pct = (price_change / prev_row["Close"]) * 100 if prev_row["Close"] != 0 else 0
 
-bearish_score = 100 - bullish_score
-
-# Determine Risk based on Position
-if position_type == "Long":
-    risk_score = bearish_score
-    risk_label = "Bearish Reversal Risk"
-else:
-    risk_score = bullish_score
-    risk_label = "Bullish Reversal Risk"
-
-# Determine Action & Styling
-if max_points == 0:
-    action = "N/A"
-    badge_class = "risk-badge-low"
-elif risk_score >= 80:
-    action = "Strong Hedge (75-100%)"
-    badge_class = "risk-badge-critical"
-elif risk_score >= 60:
-    action = "Moderate Hedge (50-75%)"
-    badge_class = "risk-badge-high"
-elif risk_score >= 40:
-    action = "Partial Hedge (25-50%)"
-    badge_class = "risk-badge-med"
-else:
-    action = "No Hedge / Unwind"
-    badge_class = "risk-badge-low"
-
-# Save to DB
-add_risk_score(currency_pair, risk_score, action, position_type)
+signal_details = compute_signal_details(last_row, prev_row, selected_indicators)
+score_details = compute_risk_score(signal_details, position_type)
+risk_score = score_details["risk_score"]
+action = score_details["action"]
+badge_class = score_details["badge_class"]
 
 
 # --- DASHBOARD LAYOUT ---
-
-# 1. KPI Header
 st.markdown(f"## {currency_pair} Executive Dashboard")
+st.caption(
+    f"Evaluated as of {valid_score_df.index[-1].strftime('%Y-%m-%d')} using data from "
+    f"{start_date} to {end_date}."
+)
+
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-
-current_price = last_row['Close']
-price_change = last_row['Close'] - prev_row['Close']
-price_pct = (price_change / prev_row['Close']) * 100
-
 with kpi1:
     st.metric("Current Price", f"{current_price:.4f}", f"{price_pct:.2f}%")
-
 with kpi2:
-    st.metric("Position", position_type, delta=None)
-
+    st.metric("Position", position_type)
 with kpi3:
-    # Custom HTML for Risk Score
-    st.markdown(f"""
-    <div style="text-align: center; padding: 10px; background-color: #161b22; border: 1px solid #30363d; border-radius: 6px;">
-        <div style="color: #8b949e; font-size: 0.8rem; margin-bottom: 4px;">RISK SCORE</div>
-        <div style="font-size: 1.8rem; font-weight: bold; color: #f0f6fc;">{risk_score}/100</div>
-    </div>
-    """, unsafe_allow_html=True)
-
+    st.markdown(
+        f"""
+        <div style="text-align: center; padding: 10px; background-color: #161b22; border: 1px solid #30363d; border-radius: 6px;">
+            <div style="color: #8b949e; font-size: 0.8rem; margin-bottom: 4px;">RISK SCORE</div>
+            <div style="font-size: 1.8rem; font-weight: bold; color: #f0f6fc;">{risk_score}/100</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 with kpi4:
-    # Custom HTML for Action
-    st.markdown(f"""
-    <div style="text-align: center; padding: 10px; background-color: #161b22; border: 1px solid #30363d; border-radius: 6px;">
-        <div style="color: #8b949e; font-size: 0.8rem; margin-bottom: 4px;">RECOMMENDATION</div>
-        <div class="{badge_class}">{action}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div style="text-align: center; padding: 10px; background-color: #161b22; border: 1px solid #30363d; border-radius: 6px;">
+            <div style="color: #8b949e; font-size: 0.8rem; margin-bottom: 4px;">RECOMMENDATION</div>
+            <div class="{badge_class}">{action}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+save_col1, save_col2 = st.columns([1, 3])
+with save_col1:
+    if st.button("Save Score Snapshot"):
+        snapshot_ts = datetime.combine(end_date, time(23, 59, 59)).strftime("%Y-%m-%d %H:%M:%S")
+        add_risk_score(currency_pair, risk_score, action, position_type, timestamp=snapshot_ts)
+        st.success("Snapshot saved to history.")
+with save_col2:
+    st.caption("This avoids saving a new database row on every rerun.")
 
 st.markdown("---")
 
-# 2. Main Chart
+# 1. Main Chart
 st.subheader("📊 Market Overview")
 fig = go.Figure()
-
-# Candlesticks
-fig.add_trace(go.Candlestick(
-    x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-    name='Price'
-))
-
-# Overlays
+fig.add_trace(
+    go.Candlestick(
+        x=display_df.index,
+        open=display_df["Open"],
+        high=display_df["High"],
+        low=display_df["Low"],
+        close=display_df["Close"],
+        name="Price",
+    )
+)
 if "SMA" in selected_indicators:
-    fig.add_trace(go.Scatter(x=df.index, y=df['SMA'], line=dict(color='orange', width=1), name='SMA 20'))
+    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["SMA"], line=dict(color="orange", width=1), name="SMA 20"))
 if "EMA" in selected_indicators:
-    fig.add_trace(go.Scatter(x=df.index, y=df['EMA'], line=dict(color='cyan', width=1), name='EMA 20'))
+    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["EMA"], line=dict(color="cyan", width=1), name="EMA 20"))
 if "Bollinger Bands" in selected_indicators:
-    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], line=dict(color='gray', width=0), showlegend=False, name='BB Upper'))
-    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], line=dict(color='gray', width=0), fill='tonexty', fillcolor='rgba(128,128,128,0.1)', name='Bollinger Bands'))
+    fig.add_trace(go.Scatter(x=display_df.index, y=display_df["BB_Upper"], line=dict(color="gray", width=0), showlegend=False, name="BB Upper"))
+    fig.add_trace(
+        go.Scatter(
+            x=display_df.index,
+            y=display_df["BB_Lower"],
+            line=dict(color="gray", width=0),
+            fill="tonexty",
+            fillcolor="rgba(128,128,128,0.1)",
+            name="Bollinger Bands",
+        )
+    )
 
 fig.update_layout(
     height=500,
     margin=dict(l=20, r=20, t=20, b=20),
-    paper_bgcolor='#0d1117',
-    plot_bgcolor='#0d1117',
-    font=dict(color='#c9d1d9'),
-    xaxis=dict(showgrid=True, gridcolor='#30363d', rangeslider=dict(visible=False)),
-    yaxis=dict(showgrid=True, gridcolor='#30363d'),
-    hovermode='x unified'
+    paper_bgcolor="#0d1117",
+    plot_bgcolor="#0d1117",
+    font=dict(color="#c9d1d9"),
+    xaxis=dict(showgrid=True, gridcolor="#30363d", rangeslider=dict(visible=False)),
+    yaxis=dict(showgrid=True, gridcolor="#30363d"),
+    hovermode="x unified",
 )
 st.plotly_chart(fig, width="stretch")
 
-
-# 3. Analysis Tabs
+# 2. Analysis Tabs
 tab_tech, tab_macro, tab_quant = st.tabs(["📉 Technicals", "🌍 Macro & News", "🧠 Quant & Forecast"])
 
 # --- TAB A: TECHNICALS ---
 with tab_tech:
     st.subheader("Technical Signal Breakdown")
     t1, t2, t3, t4 = st.columns(4)
-    
-    # Helper to display signal status
-    def signal_card(title, active, bullish, points):
-        status_color = "#238636" if bullish else "#da3633" # Green/Red
+
+    def signal_card(title: str, active: bool, bullish: bool, points: int):
+        status_color = "#238636" if bullish else "#da3633"
         status_text = "BULLISH" if bullish else "BEARISH"
         if not active:
             status_color = "#484f58"
             status_text = "INACTIVE"
-            
-        st.markdown(f"""
-        <div style="background-color: #161b22; padding: 15px; border-radius: 6px; border-left: 4px solid {status_color};">
-            <div style="font-weight: bold; color: #f0f6fc;">{title}</div>
-            <div style="color: {status_color}; font-size: 0.9rem; margin-top: 5px;">{status_text}</div>
-            <div style="color: #8b949e; font-size: 0.8rem; margin-top: 5px;">Weight: {points} pts</div>
-        </div>
-        """, unsafe_allow_html=True)
+
+        st.markdown(
+            f"""
+            <div style="background-color: #161b22; padding: 15px; border-radius: 6px; border-left: 4px solid {status_color};">
+                <div style="font-weight: bold; color: #f0f6fc;">{title}</div>
+                <div style="color: {status_color}; font-size: 0.9rem; margin-top: 5px;">{status_text}</div>
+                <div style="color: #8b949e; font-size: 0.8rem; margin-top: 5px;">Weight: {points} pts</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     with t1:
-        # Trend Logic
-        trend_bullish = last_row['EMA'] > last_row['SMA']
-        signal_card("Trend (EMA vs SMA)", "SMA" in selected_indicators and "EMA" in selected_indicators, trend_bullish, 30)
-        
+        signal_card("Trend (EMA vs SMA)", signal_details["Trend"]["active"], signal_details["Trend"]["bullish"], signal_details["Trend"]["points"])
     with t2:
-        # Momentum Logic
-        mom_bullish = (last_row['MACD'] > last_row['Signal_Line']) and (last_row['MACD'] > 0)
-        signal_card("Momentum (MACD)", "MACD" in selected_indicators, mom_bullish, 30)
-        
+        signal_card("Momentum (MACD)", signal_details["Momentum"]["active"], signal_details["Momentum"]["bullish"], signal_details["Momentum"]["points"])
     with t3:
-        # Volatility Logic
-        vol_bullish = (last_row['Close'] > last_row['BB_Upper']) or (last_row['BB_Middle'] > prev_row['BB_Middle'])
-        signal_card("Volatility (BB)", "Bollinger Bands" in selected_indicators, vol_bullish, 25)
-        
+        signal_card("Volatility (BB)", signal_details["Volatility"]["active"], signal_details["Volatility"]["bullish"], signal_details["Volatility"]["points"])
     with t4:
-        # RSI Logic
-        rsi_bullish = (last_row['RSI'] > 50) and (last_row['RSI'] > prev_row['RSI']) and (last_row['RSI'] < 70)
-        signal_card("Relative Strength (RSI)", "RSI" in selected_indicators, rsi_bullish, 15)
+        signal_card("Relative Strength (RSI)", signal_details["RSI"]["active"], signal_details["RSI"]["bullish"], signal_details["RSI"]["points"])
 
     st.markdown("---")
-    
-    # Smart Suggestion for Technicals
     st.subheader("💡 Technical Analysis Summary")
-    
-    # Build suggestion text
+
     bullish_signals = []
     bearish_signals = []
-    
-    if "SMA" in selected_indicators and "EMA" in selected_indicators:
-        if last_row['EMA'] > last_row['SMA']:
+    if signal_details["Trend"]["active"]:
+        if signal_details["Trend"]["bullish"]:
             bullish_signals.append("Strong upward trend (EMA > SMA)")
         else:
-            bearish_signals.append("Downward trend (EMA < SMA)")
-    
-    if "MACD" in selected_indicators:
-        if (last_row['MACD'] > last_row['Signal_Line']) and (last_row['MACD'] > 0):
+            bearish_signals.append("Downward trend (EMA ≤ SMA)")
+    if signal_details["Momentum"]["active"]:
+        if signal_details["Momentum"]["bullish"]:
             bullish_signals.append("Positive momentum (MACD bullish crossover)")
         else:
             bearish_signals.append("Weak momentum (MACD bearish)")
-    
-    if "Bollinger Bands" in selected_indicators:
-        if last_row['Close'] > last_row['BB_Upper']:
+    if signal_details["Volatility"]["active"]:
+        if last_row["Close"] > last_row["BB_Upper"]:
             bullish_signals.append("Price breakout above upper Bollinger Band")
-        elif last_row['Close'] < last_row['BB_Lower']:
+        elif last_row["Close"] < last_row["BB_Lower"]:
             bearish_signals.append("Price breakdown below lower Bollinger Band")
-    
-    if "RSI" in selected_indicators:
-        if last_row['RSI'] > 70:
+    if signal_details["RSI"]["active"]:
+        if last_row["RSI"] > 70:
             bearish_signals.append(f"Overbought RSI ({last_row['RSI']:.1f})")
-        elif last_row['RSI'] < 30:
+        elif last_row["RSI"] < 30:
             bullish_signals.append(f"Oversold RSI ({last_row['RSI']:.1f})")
-    
-    # Display suggestion
+
     if position_type == "Long":
         if bearish_signals:
             st.warning(f"**⚠️ Bearish Signals Detected:** {', '.join(bearish_signals)}. Consider hedging your long position.")
         elif bullish_signals:
             st.success(f"**✅ Bullish Signals:** {', '.join(bullish_signals)}. Your long position looks healthy.")
+        else:
+            st.info("No strong technical confluence right now.")
     else:
         if bullish_signals:
             st.warning(f"**⚠️ Bullish Signals Detected:** {', '.join(bullish_signals)}. Consider hedging your short position.")
         elif bearish_signals:
             st.success(f"**✅ Bearish Signals:** {', '.join(bearish_signals)}. Your short position looks healthy.")
-    
+        else:
+            st.info("No strong technical confluence right now.")
+
     st.markdown("---")
-    # Sub-charts for indicators
     if "RSI" in selected_indicators:
         fig_rsi = go.Figure()
-        fig_rsi.add_trace(go.Scatter(x=df.index, y=df['RSI'], line=dict(color='#a371f7', width=2), name='RSI'))
+        fig_rsi.add_trace(go.Scatter(x=display_df.index, y=display_df["RSI"], line=dict(color="#a371f7", width=2), name="RSI"))
         fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
         fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
-        fig_rsi.update_layout(height=200, margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor='#0d1117', plot_bgcolor='#0d1117', font=dict(color='#c9d1d9'), title="RSI Momentum")
+        fig_rsi.update_layout(
+            height=200,
+            margin=dict(l=20, r=20, t=20, b=20),
+            paper_bgcolor="#0d1117",
+            plot_bgcolor="#0d1117",
+            font=dict(color="#c9d1d9"),
+            title="RSI Momentum",
+        )
         st.plotly_chart(fig_rsi, width="stretch")
-
 
 # --- TAB B: MACRO & NEWS ---
 with tab_macro:
     m_col1, m_col2 = st.columns([1, 1])
-    
-    base_ccy = currency_pair.split('/')[0]
-    quote_ccy = currency_pair.split('/')[1]
-    
+    base_ccy = currency_pair.split("/")[0]
+    quote_ccy = currency_pair.split("/")[1]
+
     with m_col1:
         st.subheader("Economic Indicators")
         fund_service = FundamentalsService()
         fund_df = fund_service.get_comparison_df(base_ccy, quote_ccy)
-        
+
         if fund_df is not None:
             st.dataframe(
-                fund_df, 
-                use_container_width=True, 
+                fund_df,
+                use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Metric": st.column_config.TextColumn("Indicator", width="medium"),
                     base_ccy: st.column_config.TextColumn(f"{base_ccy}", width="small"),
-                    quote_ccy: st.column_config.TextColumn(f"{quote_ccy}", width="small")
-                }
+                    quote_ccy: st.column_config.TextColumn(f"{quote_ccy}", width="small"),
+                },
             )
         else:
             st.warning("Data unavailable.")
-        
-        # Smart Suggestion for Macro
+
         st.markdown("---")
         st.subheader("💡 Macro Analysis")
-        
         if fund_df is not None:
-            fund_service_obj = FundamentalsService()
-            base_data = fund_service_obj.get_fundamentals(base_ccy)
-            quote_data = fund_service_obj.get_fundamentals(quote_ccy)
-            
+            base_data = fund_service.get_fundamentals(base_ccy)
+            quote_data = fund_service.get_fundamentals(quote_ccy)
             if base_data and quote_data:
-                # Compare Interest Rates
-                base_rate = float(base_data.get('Interest Rate', '0').replace('%', ''))
-                quote_rate = float(quote_data.get('Interest Rate', '0').replace('%', ''))
-                
-                # Compare GDP Growth
-                base_gdp = float(base_data.get('GDP Growth (YoY)', '0').replace('%', ''))
-                quote_gdp = float(quote_data.get('GDP Growth (YoY)', '0').replace('%', ''))
-                
+                base_rate = float(base_data.get("Interest Rate", "0").replace("%", ""))
+                quote_rate = float(quote_data.get("Interest Rate", "0").replace("%", ""))
+                base_gdp = float(base_data.get("GDP Growth (YoY)", "0").replace("%", ""))
+                quote_gdp = float(quote_data.get("GDP Growth (YoY)", "0").replace("%", ""))
                 macro_insights = []
-                
                 if base_rate > quote_rate:
                     macro_insights.append(f"{base_ccy} has higher interest rates ({base_rate}% vs {quote_rate}%), which typically attracts capital and strengthens the currency.")
                 elif quote_rate > base_rate:
                     macro_insights.append(f"{quote_ccy} has higher interest rates ({quote_rate}% vs {base_rate}%), which may weaken {base_ccy}.")
-                
                 if base_gdp > quote_gdp:
                     macro_insights.append(f"{base_ccy} shows stronger economic growth ({base_gdp}% vs {quote_gdp}% GDP growth).")
                 elif quote_gdp > base_gdp:
                     macro_insights.append(f"{quote_ccy} shows stronger economic growth ({quote_gdp}% vs {base_gdp}% GDP growth).")
-                
                 if macro_insights:
                     st.info("**Key Insights:** " + " ".join(macro_insights))
-            
+
     with m_col2:
         st.subheader("Major Headlines")
         news_service = NewsService()
         news_items = news_service.get_combined_news(base_ccy, quote_ccy)
-        
         if news_items:
             for item in news_items:
-                badge_color = "#1f6feb" if item['currency'] == base_ccy else "#238636"
-                st.markdown(f"""
-                <div style="padding: 10px; border-radius: 5px; background-color: #161b22; border: 1px solid #30363d; margin-bottom: 10px;">
-                    <span style="background-color: {badge_color}; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.7em; font-weight: bold;">{item['currency']}</span>
-                    <span style="color: #8b949e; font-size: 0.8em; margin-left: 8px;">{item['time']}</span>
-                    <div style="margin-top: 5px; font-weight: 500; font-size: 0.9em; color: #c9d1d9;">{item['title']}</div>
-                    <div style="color: #8b949e; font-size: 0.75em; margin-top: 2px;">Source: {item['source']}</div>
-                </div>
-                """, unsafe_allow_html=True)
+                badge_color = "#1f6feb" if item["currency"] == base_ccy else "#238636"
+                st.markdown(
+                    f"""
+                    <div style="padding: 10px; border-radius: 5px; background-color: #161b22; border: 1px solid #30363d; margin-bottom: 10px;">
+                        <span style="background-color: {badge_color}; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.7em; font-weight: bold;">{item['currency']}</span>
+                        <span style="color: #8b949e; font-size: 0.8em; margin-left: 8px;">{item['time']}</span>
+                        <div style="margin-top: 5px; font-weight: 500; font-size: 0.9em; color: #c9d1d9;">{item['title']}</div>
+                        <div style="color: #8b949e; font-size: 0.75em; margin-top: 2px;">Source: {item['source']}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
         else:
             st.info("No headlines found.")
 
-
 # --- TAB C: QUANT & FORECAST ---
 with tab_quant:
-    # Changed to stacked layout for better visibility
     st.subheader("ML Price Prediction (30 Days)")
-    
+    forecast_source_df = display_df.dropna().copy()
     with st.spinner("Running Random Forest Model..."):
         ml_engine = MLEngine()
-        forecast_df = ml_engine.train_and_predict(df, forecast_days=30)
-        
+        forecast_df = ml_engine.train_and_predict(forecast_source_df, forecast_days=30) if len(forecast_source_df) >= 100 else None
+
     if forecast_df is not None:
         fig_ml = go.Figure()
-        fig_ml.add_trace(go.Scatter(x=forecast_df['Date'], y=forecast_df['Predicted_Close'], line=dict(color='#58a6ff', width=2), name='Forecast'))
-        fig_ml.add_trace(go.Scatter(x=forecast_df['Date'], y=forecast_df['Upper_Bound'], line=dict(width=0), showlegend=False))
-        fig_ml.add_trace(go.Scatter(x=forecast_df['Date'], y=forecast_df['Lower_Bound'], line=dict(width=0), fill='tonexty', fillcolor='rgba(88, 166, 255, 0.2)', name='95% Conf. Interval'))
-        
-        fig_ml.update_layout(height=400, margin=dict(l=20, r=20, t=20, b=20), paper_bgcolor='#0d1117', plot_bgcolor='#0d1117', font=dict(color='#c9d1d9'), xaxis_title="Date", yaxis_title="Price")
+        fig_ml.add_trace(go.Scatter(x=forecast_df["Date"], y=forecast_df["Predicted_Close"], line=dict(color="#58a6ff", width=2), name="Forecast"))
+        fig_ml.add_trace(go.Scatter(x=forecast_df["Date"], y=forecast_df["Upper_Bound"], line=dict(width=0), showlegend=False))
+        fig_ml.add_trace(go.Scatter(x=forecast_df["Date"], y=forecast_df["Lower_Bound"], line=dict(width=0), fill="tonexty", fillcolor="rgba(88, 166, 255, 0.2)", name="95% Conf. Interval"))
+        fig_ml.update_layout(
+            height=400,
+            margin=dict(l=20, r=20, t=20, b=20),
+            paper_bgcolor="#0d1117",
+            plot_bgcolor="#0d1117",
+            font=dict(color="#c9d1d9"),
+            xaxis_title="Date",
+            yaxis_title="Price",
+        )
         st.plotly_chart(fig_ml, width="stretch")
-        
-        # Metrics
+
         m1, m2, m3 = st.columns(3)
         m1.metric("Forecast End Price", f"{forecast_df['Predicted_Close'].iloc[-1]:.4f}")
         m2.metric("Model MSE", f"{ml_engine.mse:.6f}")
         m3.metric("Prediction Range", f"{forecast_df['Lower_Bound'].iloc[-1]:.4f} - {forecast_df['Upper_Bound'].iloc[-1]:.4f}")
-        
-        # Smart Suggestion for Quant
+
         st.markdown("---")
         st.subheader("💡 Forecast Interpretation")
-        
         forecast_start = current_price
-        forecast_end = forecast_df['Predicted_Close'].iloc[-1]
-        forecast_change = ((forecast_end - forecast_start) / forecast_start) * 100
-        
+        forecast_end = forecast_df["Predicted_Close"].iloc[-1]
+        forecast_change = ((forecast_end - forecast_start) / forecast_start) * 100 if forecast_start != 0 else 0
+
         if abs(forecast_change) < 1:
             st.info(f"📊 **Neutral Outlook:** Model predicts minimal movement ({forecast_change:+.2f}%) over the next 30 days. Consider maintaining current hedges.")
         elif forecast_change > 0:
@@ -613,39 +666,44 @@ with tab_quant:
                 st.success(f"📉 **Bearish Forecast:** Model predicts a {forecast_change:+.2f}% downside. Your short position aligns with the forecast.")
             else:
                 st.warning(f"📉 **Bearish Forecast:** Model predicts a {forecast_change:+.2f}% downside, which works against your long position. Consider hedging.")
-    
+    else:
+        st.info("Not enough data in the selected range for the ML forecast. Use a wider range if you want the model to run.")
+
     st.markdown("---")
     st.subheader("Risk Score History")
     history_df = get_risk_scores(pair=currency_pair, months=None)
-    
-    # Filter by date range
     if not history_df.empty:
-        start_dt = pd.to_datetime(start_date)
-        end_dt = pd.to_datetime(end_date) + timedelta(days=1)
-        history_df = history_df[(history_df['timestamp'] >= start_dt) & (history_df['timestamp'] < end_dt)]
-        
+        history_start = pd.Timestamp(start_date)
+        history_end = pd.Timestamp(end_date) + timedelta(days=1)
+        history_df = history_df[(history_df["timestamp"] >= history_start) & (history_df["timestamp"] < history_end)]
+
     if not history_df.empty and len(history_df) > 1:
         fig_hist = go.Figure()
-        fig_hist.add_trace(go.Scatter(
-            x=history_df['timestamp'], y=history_df['risk_score'],
-            mode='markers', marker=dict(size=8, color='#58a6ff', symbol='circle'),
-            name='Risk Score'
-        ))
+        fig_hist.add_trace(
+            go.Scatter(
+                x=history_df["timestamp"],
+                y=history_df["risk_score"],
+                mode="markers+lines",
+                marker=dict(size=8, color="#58a6ff", symbol="circle"),
+                name="Risk Score",
+            )
+        )
         fig_hist.update_layout(
-            height=400, margin=dict(l=20, r=20, t=20, b=20),
-            paper_bgcolor='#0d1117', plot_bgcolor='#0d1117', font=dict(color='#c9d1d9'),
-            xaxis=dict(title="Date", range=[start_dt, end_dt]),
+            height=400,
+            margin=dict(l=20, r=20, t=20, b=20),
+            paper_bgcolor="#0d1117",
+            plot_bgcolor="#0d1117",
+            font=dict(color="#c9d1d9"),
+            xaxis=dict(title="Date", range=[pd.Timestamp(start_date), pd.Timestamp(end_date) + timedelta(days=1)]),
             yaxis=dict(title="Risk Score", range=[0, 100]),
             shapes=[
                 dict(type="rect", xref="paper", yref="y", x0=0, y0=0, x1=1, y1=40, fillcolor="green", opacity=0.1, layer="below", line_width=0),
                 dict(type="rect", xref="paper", yref="y", x0=0, y0=40, x1=1, y1=60, fillcolor="yellow", opacity=0.1, layer="below", line_width=0),
                 dict(type="rect", xref="paper", yref="y", x0=0, y0=60, x1=1, y1=80, fillcolor="orange", opacity=0.1, layer="below", line_width=0),
-                dict(type="rect", xref="paper", yref="y", x0=0, y0=80, x1=1, y1=100, fillcolor="red", opacity=0.1, layer="below", line_width=0)
-            ]
+                dict(type="rect", xref="paper", yref="y", x0=0, y0=80, x1=1, y1=100, fillcolor="red", opacity=0.1, layer="below", line_width=0),
+            ],
         )
         st.plotly_chart(fig_hist, width="stretch")
-        
-        avg_score = history_df['risk_score'].mean()
-        st.metric("Avg Risk Score", f"{avg_score:.1f}")
+        st.metric("Avg Risk Score", f"{history_df['risk_score'].mean():.1f}")
     else:
-        st.info("Not enough history.")
+        st.info("Not enough saved history in this date range. Save a few snapshots or run your historical generator.")
